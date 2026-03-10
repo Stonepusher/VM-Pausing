@@ -1,3 +1,0 @@
-VM Name,VM ID,OS,Host,RBS Agent Status,Cluster,SLA Domain,Type
-sh2-fs-01,044561a3-2081-5cf7-97e8-7416eace9e93,Microsoft Windows Server 2025 (64-bit),Unknown,DISCONNECTED,sh2-Cork,4hr-30d-GCP_sh2-Cork,vSphere
-sh2-smb-1,071e60ee-3601-56d0-a6eb-f2f900144157,Microsoft Windows Server 2025 (64-bit),Unknown,UNREGISTERED,sh2-Cork,Bronze,vSphere
