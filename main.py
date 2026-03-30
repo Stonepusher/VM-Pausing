@@ -200,17 +200,22 @@ def get_vm_details(token: str, rsc_domain: str, vm_name: str, debug: bool, redac
 
 def get_actual_pause_state(vm_data: dict) -> Optional[bool]:
     """
-    Extracts the backup pause state for a specific VM using a priority check:
-    1. blackoutWindowStatus -> isSnappableBlackoutActive (Most reliable in provided logs)
-    2. Root-level 'isVmPaused' (Standard API)
-    3. Root-level 'vmIsPaused' (Legacy API)
+    Determines pause state by checking for open-ended snappable blackout windows.
+    A manually paused VM in Rubrik shows a window with a startTime but no endTime.
     """
-    # Check manual snappable blackout first (reflects manual pause in VMware)
+    # 1. Source of Truth: Check snappable blackout windows
+    blackout_windows = vm_data.get('blackoutWindows', {}).get('snappableBlackoutWindows', [])
+    if blackout_windows:
+        # If any window has a startTime but is missing an endTime, it's an active manual pause
+        is_paused = any(window.get('startTime') and not window.get('endTime') for window in blackout_windows)
+        return is_paused
+
+    # 2. Fallback: blackoutWindowStatus summary flag
     blackout_status = vm_data.get('blackoutWindowStatus', {})
     if 'isSnappableBlackoutActive' in blackout_status:
         return blackout_status['isSnappableBlackoutActive']
     
-    # Fallback to direct flags if present
+    # 3. Last Fallback: top-level booleans (might not be present in all responses)
     if 'isVmPaused' in vm_data:
         return vm_data['isVmPaused']
     if 'vmIsPaused' in vm_data:
@@ -219,7 +224,7 @@ def get_actual_pause_state(vm_data: dict) -> Optional[bool]:
     return None
 
 def update_vm_pause_status(config: Dict[str, str], cluster_addr: str, vm_uuid: str, vm_name: str, pause_status: bool, debug: bool, redact: bool) -> bool:
-    """Updates and Verifies backups on the local cluster."""
+    """Sets the pause state via PATCH and verifies via blackout window analysis."""
     if not cluster_addr:
         print(f"Error: Could not resolve a cluster IP for {vm_name}."); return False
 
@@ -227,39 +232,39 @@ def update_vm_pause_status(config: Dict[str, str], cluster_addr: str, vm_uuid: s
     if not cdm_token:
         print(f"Error: Auth failed for cluster {cluster_addr}"); return False
 
-    cdm_url = f"https://{cluster_addr}/api/v1/vmware/vm/VirtualMachine:::{vm_uuid}"
+    vm_id = f"VirtualMachine:::{vm_uuid}"
+    url = f"https://{cluster_addr}/api/v1/vmware/vm/{vm_id}"
     headers = {"Authorization": f"Bearer {cdm_token}", "Content-Type": "application/json"}
     
     try:
         # Step 0: PRE-CHECK 
-        check_res = requests.get(cdm_url, headers=headers, timeout=15, verify=False)
+        check_res = requests.get(url, headers=headers, timeout=15, verify=False)
         if check_res.status_code == 200:
-            current_state = get_actual_pause_state(check_res.json())
-            if current_state == pause_status:
+            if get_actual_pause_state(check_res.json()) == pause_status:
                 print(f"Skip: {vm_name} is already {'Paused' if pause_status else 'Unpaused'}.")
                 return True
 
-        # Step 1: PATCH
+        # Step 1: ISSUE PATCH COMMAND
+        # Since /pause and /resume endpoints returned 404, we use the standard PATCH method.
         payload = {"isVmPaused": pause_status}
-        debug_log(f"CDM PATCH Request - {vm_name}", {"url": cdm_url, "payload": payload}, debug, redact)
-        
-        res = requests.patch(cdm_url, headers=headers, json=payload, timeout=15, verify=False)
+        debug_log(f"CDM PATCH - {vm_name}", {"url": url, "payload": payload}, debug, redact)
+        res = requests.patch(url, headers=headers, json=payload, timeout=15, verify=False)
         debug_log(f"CDM PATCH Response - {vm_name}", res, debug, redact)
         
-        if res.status_code == 422:
-            print(f"Info: {vm_name} reports state already matches request (422).")
-        elif res.status_code not in [200, 202, 204]:
-            print(f"Trying legacy field 'vmIsPaused' for {vm_name}...")
-            res = requests.patch(cdm_url, headers=headers, json={"vmIsPaused": pause_status}, timeout=15, verify=False)
-            debug_log(f"CDM PATCH Legacy Response - {vm_name}", res, debug, redact)
-        
+        # If isVmPaused failed, try the legacy vmIsPaused field
         if res.status_code not in [200, 202, 204, 422]:
-            print(f"Update Failed: Cluster {cluster_addr} returned {res.status_code}"); return False
+            payload_legacy = {"vmIsPaused": pause_status}
+            res = requests.patch(url, headers=headers, json=payload_legacy, timeout=15, verify=False)
+            debug_log(f"CDM PATCH Legacy Response - {vm_name}", res, debug, redact)
+
+        if res.status_code not in [200, 202, 204, 422]:
+            print(f"Error: Cluster {cluster_addr} returned {res.status_code} during update.")
+            return False
             
         # Step 2: VERIFY
-        print(f"Verifying {vm_name}...")
+        print(f"Verifying {vm_name} state...")
         time.sleep(2) 
-        get_res = requests.get(cdm_url, headers=headers, timeout=15, verify=False)
+        get_res = requests.get(url, headers=headers, timeout=15, verify=False)
         if get_res.status_code == 200:
             actual = get_actual_pause_state(get_res.json())
             if actual == pause_status:
@@ -269,7 +274,7 @@ def update_vm_pause_status(config: Dict[str, str], cluster_addr: str, vm_uuid: s
                 print(f"VERIFICATION FAILED: [{cluster_addr}] State is {actual}, expected {pause_status}")
                 return False
         else:
-            print(f"Verification Error: [{cluster_addr}] Could not GET VM details.")
+            print(f"Verification Error: Could not GET VM details for {vm_name}.")
             return False
     except Exception as e:
         print(f"Error connecting to {cluster_addr}: {e}"); return False
