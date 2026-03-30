@@ -6,6 +6,7 @@ import sys
 import requests
 import yaml
 import urllib3
+import time
 from typing import Optional, Dict, List, Tuple
 
 # Suppress InsecureRequestWarning for direct cluster calls
@@ -55,11 +56,6 @@ def load_config() -> Dict[str, str]:
             if not isinstance(val, str) or not val.strip():
                 print(f"Error: Key '{key}' in {config_path} must be a non-empty string.")
                 sys.exit(1)
-            
-            if key == "RSC_DOMAIN" and "://" in val:
-                print(f"Error: RSC_DOMAIN should only be the FQDN. Remove 'https://'.")
-                sys.exit(1)
-
         return config
     except Exception as e:
         print(f"Unexpected error reading {config_path}: {e}")
@@ -68,17 +64,13 @@ def load_config() -> Dict[str, str]:
 def redact_sensitive_data(data: any) -> any:
     """Recursively redacts sensitive keys and bearer tokens from dictionaries and lists."""
     sensitive_keys = {"client_id", "client_secret", "access_token", "token", "serviceaccountid", "secret"}
-    
     if isinstance(data, dict):
         new_dict = {}
         for k, v in data.items():
-            k_low = k.lower()
-            if k_low in sensitive_keys:
+            if k.lower() in sensitive_keys:
                 new_dict[k] = "[REDACTED]"
-            elif k_low == "authorization" and isinstance(v, str) and v.lower().startswith("bearer "):
+            elif k.lower() == "authorization" and isinstance(v, str) and v.lower().startswith("bearer "):
                 new_dict[k] = "Bearer [REDACTED]"
-            elif k_low == "x-rubrik-auth-token":
-                new_dict[k] = "[REDACTED]"
             else:
                 new_dict[k] = redact_sensitive_data(v)
         return new_dict
@@ -87,348 +79,236 @@ def redact_sensitive_data(data: any) -> any:
     return data
 
 def debug_log(label: str, data: any, enabled: bool, redact: bool):
-    """Helper to print formatted debug information. Redacts if 'redact' is True."""
+    """Prints formatted debug info."""
     if enabled:
         print(f"\n[DEBUG - {label}]")
-        
-        # Determine if we should redact based on the flag
         output_data = redact_sensitive_data(data) if redact else data
-        
         if isinstance(output_data, (dict, list)):
             print(json.dumps(output_data, indent=2))
         elif isinstance(data, requests.models.Response):
-            # Special handling for Response objects
             print(f"Status Code: {data.status_code}")
-            print("Headers:")
-            headers_dict = dict(data.headers)
-            print(json.dumps(redact_sensitive_data(headers_dict) if redact else headers_dict, indent=2))
-            print("Body:")
             try:
-                body_json = data.json()
-                print(json.dumps(redact_sensitive_data(body_json) if redact else body_json, indent=2))
-            except ValueError:
-                print("[Non-JSON Body Content]")
+                headers_dict = dict(data.headers)
+                print("Headers:", json.dumps(redact_sensitive_data(headers_dict) if redact else headers_dict, indent=2))
+                print("Body:", json.dumps(data.json(), indent=2))
+            except:
+                print(f"Body: {data.text[:500]}...")
         else:
             print(output_data)
 
 def get_rsc_token(config: Dict[str, str], debug: bool, redact: bool) -> str:
-    """Authenticates with RSC using Service Account credentials."""
+    """Authenticates with RSC."""
     auth_url = f"https://{config['RSC_DOMAIN']}/api/client_token"
-    payload = {
-        "client_id": config['CLIENT_ID'],
-        "client_secret": config['CLIENT_SECRET'],
-        "name": "RSC_Dynamic_Cluster_Automation"
-    }
+    payload = {"client_id": config['CLIENT_ID'], "client_secret": config['CLIENT_SECRET']}
     
-    debug_log("RSC Auth Request URL", auth_url, debug, redact)
-    debug_log("RSC Auth Payload", payload, debug, redact)
+    debug_log("RSC Token Request", {"url": auth_url, "payload": payload}, debug, redact)
     
-    import time
-    for delay in [1, 2, 4, 8, 16]:
+    for delay in [1, 2, 4]:
         try:
             response = requests.post(auth_url, json=payload, timeout=15)
-            debug_log("RSC Auth Raw Response", response, debug, redact)
-            # If we get a 200, return the token
+            debug_log("RSC Token Response", response, debug, redact)
             if response.status_code == 200:
-                res_json = response.json()
-                return res_json.get("access_token")
-            # Otherwise, raise for status to trigger retry if it's a transient error
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            debug_log("RSC Auth Attempt Error", str(e), debug, redact)
+                return response.json().get("access_token")
+        except Exception as e:
+            debug_log("RSC Token Request Exception", str(e), debug, redact)
             time.sleep(delay)
-    
-    print("Error: Failed to authenticate with RSC after multiple retries.")
-    sys.exit(1)
-
-def get_cdm_token(cluster_addr: str, config: Dict[str, str], debug: bool, redact: bool) -> Optional[str]:
-    """Obtains a session token from a local CDM cluster using RSC Service Account credentials."""
-    cdm_auth_url = f"https://{cluster_addr}/api/v1/service_account/session"
-    payload = {
-        "serviceAccountId": config['CLIENT_ID'],
-        "secret": config['CLIENT_SECRET']
-    }
-
-    debug_log("CDM Service Account Auth Request URL", cdm_auth_url, debug, redact)
-    debug_log("CDM Service Account Auth Payload", payload, debug, redact)
-
-    try:
-        response = requests.post(cdm_auth_url, json=payload, timeout=15, verify=False)
-        debug_log("CDM Service Account Auth Raw Response", response, debug, redact)
-        
-        if response.status_code == 200:
-            token = response.json().get("token")
-            if token and token != "null":
-                return token
-        
-        print(f"Error: CDM authentication failed on {cluster_addr} (Status: {response.status_code})")
-        return None
-    except Exception as e:
-        print(f"Error: Failed to connect to CDM for authentication on {cluster_addr}: {e}")
-        return None
+    print("Error: RSC Auth failed."); sys.exit(1)
 
 def get_cluster_ip(token: str, rsc_domain: str, cluster_uuid: str, debug: bool, redact: bool) -> Optional[str]:
-    """
-    Issues a ClusterDetailQuery to find a reachable IP address for a cluster node.
-    """
-    graphql_url = f"https://{rsc_domain}/api/graphql"
-    
+    """Fallback to find a reachable node IP if defaultAddress is missing."""
+    url = f"https://{rsc_domain}/api/graphql"
     query = """
     query GetClusterNodes($id: UUID!) {
       cluster(clusterUuid: $id) {
-        id
-        name
-        defaultAddress
         clusterNodeConnection {
-          nodes {
-            ipAddress
-            status
-          }
+          nodes { ipAddress status }
         }
       }
     }
     """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {'query': query, 'variables': {'id': cluster_uuid}}
     
-    variables = {"id": cluster_uuid}
-    headers = {
-        "Authorization": f"Bearer {token}", 
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
-    payload = {'query': query, 'variables': variables}
-    debug_log("Cluster Discovery Request", payload, debug, redact)
+    debug_log("Cluster Node Query", payload, debug, redact)
     
     try:
-        response = requests.post(graphql_url, json=payload, headers=headers, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        debug_log("Cluster Discovery Response", data, debug, redact)
-        
-        cluster = data.get('data', {}).get('cluster', {})
-        if not cluster:
-            return None
-            
-        if cluster.get('defaultAddress'):
-            return cluster['defaultAddress']
-            
-        nodes = cluster.get('clusterNodeConnection', {}).get('nodes', [])
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        debug_log("Cluster Node Response", res, debug, redact)
+        nodes = res.json().get('data', {}).get('cluster', {}).get('clusterNodeConnection', {}).get('nodes', [])
         for node in nodes:
             if node.get('ipAddress') and node.get('status', '').upper() == 'OK':
                 return node['ipAddress']
-        
-        if nodes and nodes[0].get('ipAddress'):
-            return nodes[0]['ipAddress']
-            
-        return None
+        if nodes: return nodes[0].get('ipAddress')
     except Exception as e:
-        debug_log("Cluster Discovery Error", str(e), debug, redact)
+        debug_log("Cluster Node Exception", str(e), debug, redact)
+    return None
+
+def get_cdm_token(cluster_addr: str, config: Dict[str, str], debug: bool, redact: bool) -> Optional[str]:
+    """Obtains a session token from a local CDM cluster."""
+    url = f"https://{cluster_addr}/api/v1/service_account/session"
+    payload = {"serviceAccountId": config['CLIENT_ID'], "secret": config['CLIENT_SECRET']}
+    
+    debug_log(f"CDM Session Auth Request ({cluster_addr})", payload, debug, redact)
+    
+    try:
+        res = requests.post(url, json=payload, timeout=15, verify=False)
+        debug_log(f"CDM Session Auth Response ({cluster_addr})", res, debug, redact)
+        return res.json().get("token") if res.status_code == 200 else None
+    except Exception as e:
+        debug_log(f"CDM Session Auth Exception ({cluster_addr})", str(e), debug, redact)
         return None
 
-def get_vm_details(token: str, rsc_domain: str, vm_name: str, debug: bool, redact: bool) -> Optional[Tuple[str, str, str]]:
-    """Queries RSC GraphQL API for VM RSC ID, CDM ID, and CDM cluster address."""
-    graphql_url = f"https://{rsc_domain}/api/graphql"
-    
+def get_vm_details(token: str, rsc_domain: str, vm_name: str, debug: bool, redact: bool) -> Optional[Tuple[str, str]]:
+    """Queries RSC for VM UUID and cluster address."""
+    url = f"https://{rsc_domain}/api/graphql"
     query = """
-    query GetVmDetails($name: String!) {
-      vSphereVmNewConnection(filter: [
-        {field: NAME, texts: [$name]},
-        {field: IS_RELIC, texts: ["false"]}
-      ]) {
-        nodes {
-          id
-          cdmId
-          name
-          cluster {
-            id
-            name
-            defaultAddress
-          }
+    query GetVm($name: String!) {
+      vSphereVmNewConnection(filter: [{field: NAME, texts: [$name]}, {field: IS_RELIC, texts: ["false"]}]) {
+        nodes { 
+          cdmId 
+          id 
+          name 
+          cluster { id defaultAddress } 
         }
       }
     }
     """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {'query': query, 'variables': {'name': vm_name}}
     
-    variables = {"name": vm_name}
-    headers = {
-        "Authorization": f"Bearer {token}", 
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    
-    raw_payload = {'query': query, 'variables': variables}
-    debug_log("GraphQL Request URL", graphql_url, debug, redact)
-    debug_log("GraphQL Request Headers", headers, debug, redact)
-    debug_log("GraphQL Request Payload", raw_payload, debug, redact)
+    debug_log("VM Discovery Query", payload, debug, redact)
     
     try:
-        response = requests.post(
-            graphql_url, 
-            json=raw_payload, 
-            headers=headers,
-            timeout=15
-        )
-        debug_log("GraphQL Raw Response", response, debug, redact)
-        response.raise_for_status()
-        data = response.json()
-        
-        nodes = data.get('data', {}).get('vSphereVmNewConnection', {}).get('nodes', [])
-        if not nodes:
-            return None
-        
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        debug_log("VM Discovery Response", res, debug, redact)
+        nodes = res.json().get('data', {}).get('vSphereVmNewConnection', {}).get('nodes', [])
         for node in nodes:
             if node['name'].lower() == vm_name.lower():
-                rsc_vm_id = node['id']
-                cdm_vm_id = node.get('cdmId')
+                raw_id = node.get('cdmId') or node.get('id')
+                vm_uuid = raw_id.split(':::')[-1]
+                
                 cluster = node.get('cluster', {})
-                cluster_uuid = cluster.get('id')
-                cluster_address = cluster.get('defaultAddress')
+                address = cluster.get('defaultAddress')
                 
-                target_vm_id = cdm_vm_id if cdm_vm_id else rsc_vm_id
-
-                if not cluster_address and cluster_uuid:
-                    print(f"Info: Cluster address missing in VM metadata. Discovering node IPs for cluster '{cluster.get('name')}'...")
-                    cluster_address = get_cluster_ip(token, rsc_domain, cluster_uuid, debug, redact)
+                if not address and cluster.get('id'):
+                    address = get_cluster_ip(token, rsc_domain, cluster['id'], debug, redact)
                 
-                if not cluster_address:
-                    print(f"Warning: VM '{vm_name}' resolved to cluster '{cluster.get('name')}', but no connection address or node IPs were found.")
-                    return None
-                    
-                return rsc_vm_id, target_vm_id, cluster_address
-                
-        return None
+                return vm_uuid, address
     except Exception as e:
-        print(f"Error querying GraphQL for {vm_name}: {e}")
-        return None
+        debug_log("VM Discovery Exception", str(e), debug, redact)
+    return None
 
-def update_vm_pause_status(config: Dict[str, str], cluster_addr: str, vm_id: str, vm_name: str, pause_status: bool, debug: bool, redact: bool) -> bool:
-    """Obtains a cluster-specific token and sends PATCH request to the CDM Cluster."""
-    if not cluster_addr or cluster_addr.lower() == 'none':
-        print(f"Error: Invalid cluster address provided for {vm_name}. Cannot issue REST call.")
-        return False
+def get_actual_pause_state(vm_data: dict) -> Optional[bool]:
+    """
+    Extracts the backup pause state for a specific VM using a priority check:
+    1. blackoutWindowStatus -> isSnappableBlackoutActive (Most reliable in provided logs)
+    2. Root-level 'isVmPaused' (Standard API)
+    3. Root-level 'vmIsPaused' (Legacy API)
+    """
+    # Check manual snappable blackout first (reflects manual pause in VMware)
+    blackout_status = vm_data.get('blackoutWindowStatus', {})
+    if 'isSnappableBlackoutActive' in blackout_status:
+        return blackout_status['isSnappableBlackoutActive']
+    
+    # Fallback to direct flags if present
+    if 'isVmPaused' in vm_data:
+        return vm_data['isVmPaused']
+    if 'vmIsPaused' in vm_data:
+        return vm_data['vmIsPaused']
+        
+    return None
 
-    # 1. Obtain a cluster-specific token using Client ID/Secret via service_account/session
+def update_vm_pause_status(config: Dict[str, str], cluster_addr: str, vm_uuid: str, vm_name: str, pause_status: bool, debug: bool, redact: bool) -> bool:
+    """Updates and Verifies backups on the local cluster."""
+    if not cluster_addr:
+        print(f"Error: Could not resolve a cluster IP for {vm_name}."); return False
+
     cdm_token = get_cdm_token(cluster_addr, config, debug, redact)
     if not cdm_token:
-        print(f"Error: Could not authenticate with cluster {cluster_addr}.")
-        return False
+        print(f"Error: Auth failed for cluster {cluster_addr}"); return False
 
-    # 2. Prep the VM ID for the CDM API call (requires VirtualMachine::: prefix)
-    target_cdm_vm_id = f"VirtualMachine:::{vm_id}" if "VirtualMachine:::" not in vm_id else vm_id
-
-    # 3. Issue the PATCH call using the cluster-specific token
-    cdm_url = f"https://{cluster_addr}/api/v1/vmware/vm/{target_cdm_vm_id}"
-    headers = {
-        "Authorization": f"Bearer {cdm_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    data = {"vmIsPaused": pause_status}
-    
-    debug_log("CDM REST Request URL", cdm_url, debug, redact)
-    debug_log("CDM REST Request Headers", headers, debug, redact)
-    debug_log("CDM REST Request Payload", data, debug, redact)
+    cdm_url = f"https://{cluster_addr}/api/v1/vmware/vm/VirtualMachine:::{vm_uuid}"
+    headers = {"Authorization": f"Bearer {cdm_token}", "Content-Type": "application/json"}
     
     try:
-        response = requests.patch(cdm_url, headers=headers, json=data, timeout=15, verify=False)
-        debug_log("CDM REST Raw Response", response, debug, redact)
+        # Step 0: PRE-CHECK 
+        check_res = requests.get(cdm_url, headers=headers, timeout=15, verify=False)
+        if check_res.status_code == 200:
+            current_state = get_actual_pause_state(check_res.json())
+            if current_state == pause_status:
+                print(f"Skip: {vm_name} is already {'Paused' if pause_status else 'Unpaused'}.")
+                return True
+
+        # Step 1: PATCH
+        payload = {"isVmPaused": pause_status}
+        debug_log(f"CDM PATCH Request - {vm_name}", {"url": cdm_url, "payload": payload}, debug, redact)
         
-        if response.status_code == 200:
-            action = "Paused" if pause_status else "Unpaused"
-            print(f"Success: [{cluster_addr}] {action} {vm_name}")
-            return True
+        res = requests.patch(cdm_url, headers=headers, json=payload, timeout=15, verify=False)
+        debug_log(f"CDM PATCH Response - {vm_name}", res, debug, redact)
+        
+        if res.status_code == 422:
+            print(f"Info: {vm_name} reports state already matches request (422).")
+        elif res.status_code not in [200, 202, 204]:
+            print(f"Trying legacy field 'vmIsPaused' for {vm_name}...")
+            res = requests.patch(cdm_url, headers=headers, json={"vmIsPaused": pause_status}, timeout=15, verify=False)
+            debug_log(f"CDM PATCH Legacy Response - {vm_name}", res, debug, redact)
+        
+        if res.status_code not in [200, 202, 204, 422]:
+            print(f"Update Failed: Cluster {cluster_addr} returned {res.status_code}"); return False
+            
+        # Step 2: VERIFY
+        print(f"Verifying {vm_name}...")
+        time.sleep(2) 
+        get_res = requests.get(cdm_url, headers=headers, timeout=15, verify=False)
+        if get_res.status_code == 200:
+            actual = get_actual_pause_state(get_res.json())
+            if actual == pause_status:
+                print(f"VERIFIED: {vm_name} is now {'Paused' if pause_status else 'Unpaused'} (Node: {cluster_addr})")
+                return True
+            else:
+                print(f"VERIFICATION FAILED: [{cluster_addr}] State is {actual}, expected {pause_status}")
+                return False
         else:
-            print(f"Failed to update {vm_name} on {cluster_addr}: {response.status_code} - {response.text}")
+            print(f"Verification Error: [{cluster_addr}] Could not GET VM details.")
             return False
     except Exception as e:
-        print(f"Error connecting to cluster {cluster_addr} for {vm_name}: {e}")
-        return False
-
-def validate_csv(filepath: str) -> List[Dict[str, str]]:
-    """Extracts VM data and skips headers."""
-    if not os.path.exists(filepath):
-        print(f"Error: File '{filepath}' not found.")
-        sys.exit(1)
-        
-    vm_data_list = []
-    try:
-        with open(filepath, mode='r', encoding='utf-8') as f:
-            sample = f.read(2048)
-            f.seek(0)
-            sniffer = csv.Sniffer()
-            dialect = sniffer.sniff(sample)
-            has_header = sniffer.has_header(sample)
-            reader = csv.reader(f, dialect)
-            
-            if has_header:
-                next(reader)
-            
-            for row in reader:
-                if row:
-                    vm_name = row[0].strip()
-                    if not vm_name or vm_name.lower() in ["vm_name", "name", "vm name", "virtual machine"]:
-                        continue
-                    
-                    provided_id = next((cell.strip() for cell in row[1:] if cell.strip().startswith("VmwareVm:::")), None)
-                    vm_data_list.append({"name": vm_name, "provided_id": provided_id})
-                        
-    except Exception as e:
-        print(f"Error parsing CSV: {e}")
-        sys.exit(1)
-        
-    return vm_data_list
+        print(f"Error connecting to {cluster_addr}: {e}"); return False
 
 def main():
     config = load_config()
-
-    parser = argparse.ArgumentParser(description="Batch pause/unpause Rubrik backups via CSV.")
-    parser.add_argument("-f", "--file", required=True, help="Path to the source CSV file.")
-    parser.add_argument("-d", "--debug", action="store_true", help="Enable verbose debug logging of API calls.")
-    parser.add_argument("-r", "--redact", action="store_true", help="Redact sensitive info (IDs, secrets, tokens) from debug output.")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", "--file", required=True)
+    parser.add_argument("-d", "--debug", action="store_true")
+    parser.add_argument("-r", "--redact", action="store_true")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("-p", "--pause", action="store_true", help="Pause backups (vmIsPaused: True).")
-    group.add_argument("-u", "--unpause", action="store_true", help="Unpause backups (vmIsPaused: False).")
+    group.add_argument("-p", "--pause", action="store_true")
+    group.add_argument("-u", "--unpause", action="store_true")
     
     args = parser.parse_args()
     pause_value = True if args.pause else False
     
-    vm_list = validate_csv(args.file)
-    print(f"Loaded {len(vm_list)} VM entries. Action: {'Pausing' if pause_value else 'Unpausing'} VMs.")
-    
-    # RSC Authentication
+    vms = []
+    with open(args.file, 'r') as f:
+        reader = csv.reader(f)
+        next(reader, None) # Skip header
+        for row in reader:
+            if row: vms.append(row[0].strip())
+
     rsc_token = get_rsc_token(config, args.debug, args.redact)
-    
     success, fail = 0, 0
-    for vm in vm_list:
-        print(f"\nProcessing: {vm['name']}")
-        
-        # Discovery via RSC
-        details = get_vm_details(rsc_token, config['RSC_DOMAIN'], vm['name'], args.debug, args.redact)
-        
-        if not details:
-            print(f"Warning: Could not resolve '{vm['name']}' in RSC or find its cluster address.")
-            fail += 1
-            continue
-            
-        rsc_vm_id, cdm_vm_id, cluster_addr = details
-        
-        # ID checks
-        if vm['provided_id'] and vm['provided_id'] != rsc_vm_id:
-            print(f"CRITICAL: ID mismatch for '{vm['name']}'!")
-            print(f"  CSV ID: {vm['provided_id']}")
-            print(f"  RSC ID: {rsc_vm_id}")
-            print(f"  Skipping this VM to prevent accidental update.")
-            fail += 1
-            continue
-        
-        # CDM Cluster Update
-        if update_vm_pause_status(config, cluster_addr, cdm_vm_id, vm['name'], pause_value, args.debug, args.redact):
-            success += 1
+    for name in vms:
+        print(f"\nProcessing: {name}")
+        details = get_vm_details(rsc_token, config['RSC_DOMAIN'], name, args.debug, args.redact)
+        if details and details[1]:
+            if update_vm_pause_status(config, details[1], details[0], name, pause_value, args.debug, args.redact):
+                success += 1; continue
+        elif details and not details[1]:
+            print(f"Error: VM '{name}' found, but cluster address is missing.")
         else:
-            fail += 1
+            print(f"Error: Could not find '{name}' in RSC.")
+        fail += 1
             
-    print(f"\nDone. Success: {success}, Fail: {fail}")
+    print(f"\nSummary - Success: {success}, Fail: {fail}")
 
 if __name__ == "__main__":
     main()
